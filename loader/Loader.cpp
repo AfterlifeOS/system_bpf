@@ -175,6 +175,29 @@ static int readSectionByName(const char* name, ifstream& elfFile, vector<T>& dat
     return -2;
 }
 
+unsigned int readSectionUint(const char* name, ifstream& elfFile, unsigned int defVal) {
+    vector<char> theBytes;
+    int ret = readSectionByName(name, elfFile, theBytes);
+    if (ret) {
+        ALOGV("Couldn't find section %s (defaulting to %u [0x%x]).", name, defVal, defVal);
+        return defVal;
+    } else if (theBytes.size() < sizeof(unsigned int)) {
+        ALOGE("Section %s too short (defaulting to %u [0x%x]).", name, defVal, defVal);
+        return defVal;
+    } else {
+        // decode first 4 bytes as LE32 uint, there will likely be more bytes due to alignment.
+        unsigned int value = static_cast<unsigned char>(theBytes[3]);
+        value <<= 8;
+        value += static_cast<unsigned char>(theBytes[2]);
+        value <<= 8;
+        value += static_cast<unsigned char>(theBytes[1]);
+        value <<= 8;
+        value += static_cast<unsigned char>(theBytes[0]);
+        ALOGV("Section %s value is %u [0x%x]", name, value, value);
+        return value;
+    }
+}
+
 static int readSectionByType(ifstream& elfFile, int type, vector<char>& data) {
     vector<Elf64_Shdr> shTable;
     if (readSectionHeadersAll(elfFile, shTable)) return -1;
@@ -339,6 +362,54 @@ static int getSymNameByIdx(ifstream& elfFile, int index, string& name) {
     return getSymName(elfFile, symtab[index].st_name, name);
 }
 
+static bool mapMatchesExpectations(const unique_fd& fd, const string& mapName,
+                                   const struct bpf_map_def& mapDef, const enum bpf_map_type type) {
+    // Assuming fd is a valid Bpf Map file descriptor then
+    // all the following should always succeed on a 4.14+ kernel.
+    // If they somehow do fail, they'll return -1 (and set errno),
+    // which should then cause (among others) a key_size mismatch.
+    int fd_type = bpfGetFdMapType(fd);
+    int fd_key_size = bpfGetFdKeySize(fd);
+    int fd_value_size = bpfGetFdValueSize(fd);
+    int fd_max_entries = bpfGetFdMaxEntries(fd);
+    int fd_map_flags = bpfGetFdMapFlags(fd);
+
+    // DEVMAPs are readonly from the bpf program side's point of view, as such
+    // the kernel in kernel/bpf/devmap.c dev_map_init_map() will set the flag
+    int desired_map_flags = (int)mapDef.map_flags;
+    if (type == BPF_MAP_TYPE_DEVMAP || type == BPF_MAP_TYPE_DEVMAP_HASH)
+        desired_map_flags |= BPF_F_RDONLY_PROG;
+
+    // The .h file enforces that this is a power of two, and page size will
+    // also always be a power of two, so this logic is actually enough to
+    // force it to be a multiple of the page size, as required by the kernel.
+    unsigned int desired_max_entries = mapDef.max_entries;
+    if (type == BPF_MAP_TYPE_RINGBUF) {
+        if (desired_max_entries < page_size) desired_max_entries = page_size;
+    }
+
+    // The following checks should *never* trigger, if one of them somehow does,
+    // it probably means a bpf .o file has been changed/replaced at runtime
+    // and bpfloader was manually rerun (normally it should only run *once*
+    // early during the boot process).
+    // Another possibility is that something is misconfigured in the code:
+    // most likely a shared map is declared twice differently.
+    // But such a change should never be checked into the source tree...
+    if ((fd_type == type) &&
+        (fd_key_size == (int)mapDef.key_size) &&
+        (fd_value_size == (int)mapDef.value_size) &&
+        (fd_max_entries == (int)desired_max_entries) &&
+        (fd_map_flags == desired_map_flags)) {
+        return true;
+    }
+
+    ALOGE("bpf map name %s mismatch: desired/found: "
+          "type:%d/%d key:%u/%d value:%u/%d entries:%u/%d flags:%u/%d",
+          mapName.c_str(), type, fd_type, mapDef.key_size, fd_key_size, mapDef.value_size,
+          fd_value_size, mapDef.max_entries, fd_max_entries, desired_map_flags, fd_map_flags);
+    return false;
+}
+
 static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds) {
     int ret;
     vector<struct bpf_map_def> md;
@@ -371,11 +442,23 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             continue;
         }
 
+        enum bpf_map_type type = md[i].type;
+        if (type == BPF_MAP_TYPE_DEVMAP_HASH && !isAtLeastKernelVersion(5, 4, 0)) {
+            // On Linux Kernels older than 5.4 this map type doesn't exist, but it can kind
+            // of be approximated: HASH has the same userspace visible api.
+            // However it cannot be used by ebpf programs in the same way.
+            // Since bpf_redirect_map() only requires 4.14, a program using a DEVMAP_HASH map
+            // would fail to load (due to trying to redirect to a HASH instead of DEVMAP_HASH).
+            // One must thus tag any BPF_MAP_TYPE_DEVMAP_HASH + bpf_redirect_map() using
+            // programs as being 5.4+...
+            type = BPF_MAP_TYPE_HASH;
+        }
+
         // The .h file enforces that this is a power of two, and page size will
         // also always be a power of two, so this logic is actually enough to
         // force it to be a multiple of the page size, as required by the kernel.
         unsigned int max_entries = md[i].max_entries;
-        if (md[i].type == BPF_MAP_TYPE_RINGBUF) {
+        if (type == BPF_MAP_TYPE_RINGBUF) {
             if (max_entries < page_size) max_entries = page_size;
         }
 
@@ -395,19 +478,26 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             reuse = true;
         } else {
             union bpf_attr req = {
-              .map_type = md[i].type,
+              .map_type = type,
               .key_size = md[i].key_size,
               .value_size = md[i].value_size,
               .max_entries = max_entries,
               .map_flags = md[i].map_flags,
             };
-            strlcpy(req.map_name, mapNames[i].c_str(), sizeof(req.map_name));
+
+            if (isAtLeastKernelVersion(4, 15, 0))
+                strlcpy(req.map_name, mapNames[i].c_str(), sizeof(req.map_name));
             fd.reset(bpf(BPF_MAP_CREATE, req));
             saved_errno = errno;
             ALOGV("bpf_create_map name %s, ret: %d", mapNames[i].c_str(), fd.get());
         }
 
         if (!fd.ok()) return -saved_errno;
+
+        // When reusing a pinned map, we need to check the map type/sizes/etc match, but for
+        // safety (since reuse code path is rare) run these checks even if we just created it.
+        // We assume failure is due to pinned map mismatch, hence the 'NOT UNIQUE' return code.
+        if (!mapMatchesExpectations(fd, mapNames[i], md[i], type)) return -ENOTUNIQ;
 
         if (!reuse) {
             ret = bpfFdPin(fd, mapPinLoc.c_str());
@@ -430,6 +520,13 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
                       ret, err, strerror(err));
                 return -err;
             }
+        }
+
+        int mapId = bpfGetFdMapId(fd);
+        if (mapId == -1) {
+            ALOGE("bpfGetFdMapId failed, ret: %d [%d]", mapId, errno);
+        } else {
+            ALOGD("map %s id %d", mapPinLoc.c_str(), mapId);
         }
 
         mapFds.push_back(std::move(fd));
@@ -546,7 +643,8 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
               .log_buf = ptr_to_u64(log_buf.data()),
               .log_size = static_cast<__u32>(log_buf.size()),
             };
-            strlcpy(req.prog_name, cs[i].name.c_str(), sizeof(req.prog_name));
+            if (isAtLeastKernelVersion(4, 15, 0))
+                strlcpy(req.prog_name, cs[i].name.c_str(), sizeof(req.prog_name));
             fd.reset(bpf(BPF_PROG_LOAD, req));
 
             if (!fd.ok()) {
@@ -588,6 +686,13 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                       cs[i].prog_def->gid, err, strerror(err));
                 return -err;
             }
+        }
+
+        int progId = bpfGetFdProgId(fd);
+        if (progId == -1) {
+            ALOGE("bpfGetFdProgId failed, ret: %d [%d]", progId, errno);
+        } else {
+            ALOGD("prog %s id %d", progPinLoc.c_str(), progId);
         }
     }
 
